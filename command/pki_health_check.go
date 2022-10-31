@@ -1,12 +1,18 @@
 package command
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
+	"github.com/hashicorp/vault/command/healthcheck"
+
+	"github.com/ghodss/yaml"
 	"github.com/mitchellh/cli"
 	"github.com/posener/complete"
+	"github.com/ryanuber/columnize"
 )
 
 const (
@@ -78,7 +84,7 @@ Usage: vault pki health-check [options] MOUNT
 }
 
 func (c *PKIHealthCheckCommand) Flags() *FlagSets {
-	set := c.flagSet(FlagSetHTTP)
+	set := c.flagSet(FlagSetHTTP | FlagSetOutputFormat)
 	f := set.NewFlagSet("Command Options")
 
 	f.StringVar(&StringVar{
@@ -163,7 +169,112 @@ func (c *PKIHealthCheckCommand) Run(args []string) int {
 		return pkiRetUsage
 	}
 
-	// mount := sanitizePath(args[0])
+	client, err := c.Client()
+	if err != nil {
+		c.UI.Error(err.Error())
+		return pkiRetUsage
+	}
+	mount := sanitizePath(args[0])
 
-	return 0
+	executor := healthcheck.NewExecutor(client, mount)
+	executor.AddCheck(healthcheck.NewCAValidityPeriodCheck())
+	if c.flagDefaultDisabled {
+		executor.DefaultEnabled = false
+	}
+
+	if c.flagList {
+		c.UI.Output("Health Checks:")
+		for _, checker := range executor.Checkers {
+			c.UI.Output(" - " + checker.Name())
+		}
+
+		return pkiRetOK
+	}
+
+	external_config := map[string]interface{}{}
+	if c.flagConfig != "" {
+		contents, err := os.ReadFile(c.flagConfig)
+		if err != nil {
+			c.UI.Error(fmt.Sprintf("Failed to read configuration file %v: %v", c.flagConfig, err))
+			return pkiRetUsage
+		}
+
+		if err := json.Unmarshal(contents, &external_config); err != nil {
+			c.UI.Error(fmt.Sprintf("Failed to parse configuration file %v: %v", c.flagConfig, err))
+			return pkiRetUsage
+		}
+	}
+
+	if err := executor.BuildConfig(external_config); err != nil {
+		c.UI.Error(fmt.Sprintf("Failed to build health check configuration: %v", err))
+		return pkiRetUsage
+	}
+
+	results, err := executor.Execute()
+	if err != nil {
+		c.UI.Error(fmt.Sprintf("Failed to run health check: %v", err))
+		return pkiRetUsage
+	}
+
+	if err := c.outputResults(results); err != nil {
+		c.UI.Error(fmt.Sprintf("Failed to render results for display: %v", err))
+	}
+
+	return pkiRetOK
+}
+
+func (c *PKIHealthCheckCommand) outputResults(results map[string][]*healthcheck.Result) error {
+	switch Format(c.UI) {
+	case "", "table":
+		return c.outputResultsTable(results)
+	case "json":
+		return c.outputResultsJSON(results)
+	case "yaml":
+		return c.outputResultsYAML(results)
+	default:
+		return fmt.Errorf("unknown output format: %v", Format(c.UI))
+	}
+}
+
+func (c *PKIHealthCheckCommand) outputResultsTable(results map[string][]*healthcheck.Result) error {
+	for scanner, findings := range results {
+		c.UI.Output(scanner)
+		c.UI.Output(strings.Repeat("-", len(scanner)))
+		data := []string{"status" + hopeDelim + "endpoint" + hopeDelim + "message"}
+		for _, finding := range findings {
+			row := []string{
+				finding.StatusDisplay,
+				finding.Endpoint,
+				finding.Message,
+			}
+			data = append(data, strings.Join(row, hopeDelim))
+		}
+
+		c.UI.Output(tableOutput(data, &columnize.Config{
+			Delim: hopeDelim,
+		}))
+		c.UI.Output("\n")
+	}
+
+	return nil
+}
+
+func (c *PKIHealthCheckCommand) outputResultsJSON(results map[string][]*healthcheck.Result) error {
+	bytes, err := json.MarshalIndent(results, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	c.UI.Output(string(bytes))
+	return nil
+}
+
+func (c *PKIHealthCheckCommand) outputResultsYAML(results map[string][]*healthcheck.Result) error {
+	bytes, err := yaml.Marshal(results)
+	if err != nil {
+		return err
+	}
+
+	c.UI.Output(string(bytes))
+	return nil
 }
